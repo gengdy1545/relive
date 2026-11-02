@@ -66,9 +66,9 @@ For a storage-only diagnostic in a socket-restricted environment, use
 
 ## SIBench integration
 
-[SIBench](https://github.com/gengdy1545/SIBench) configures this repository as
-the `index/relive` submodule. The initial commit and parent gitlink are pending;
-the submodule cannot be reproduced from that configuration alone.
+[SIBench](https://github.com/gengdy1545/SIBench) pins this repository as
+the `index/relive` submodule. Initialize it from the SIBench checkout with
+`git submodule update --init index/relive`.
 Relive implementation belongs in this repository; SIBench owns workload capture,
 Trace interpretation, replay, and result validation. SIBench's `relive` adapter
 translates online calls, including transaction staging and streaming results,
@@ -127,11 +127,18 @@ idempotent resubmission.
 
 ## Bounded publication diagnostic
 
-From SIBench after `scripts/build-relive.sh`, run the Java synthetic workload
-through the orchestration script, with fresh output and state paths:
+After `mvn package` in this repository, use Python 3 to run the Java synthetic
+workload through the orchestration script, with fresh output and state paths:
 
 ```bash
-python3 scripts/probe_relive.py build/index/relive/relive.jar \
+python3 scripts/probe_relive.py build/relive.jar build/test-classes \
+  build/probe-results build/services/relive-probe --maintenance
+```
+
+From a SIBench checkout after `scripts/build-relive.sh`, use the same script:
+
+```bash
+python3 index/relive/scripts/probe_relive.py build/index/relive/relive.jar \
   build/index/relive/test-classes results/relive-probe build/services/relive-probe \
   --maintenance
 ```
