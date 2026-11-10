@@ -86,6 +86,20 @@ public class FileSelectionTest {
         assertFalse(bounds.overlaps(null, false, "10", false));
         assertTrue(bounds.overlaps(null, false, null, false));
         assertThrows(IllegalArgumentException.class, () -> new Layout.Bounds("80", "10"));
-        assertThrows(IllegalArgumentException.class, () -> new Layout.Run("00000000-0000-0000-0000-000000000000.sst", Map.of()));
+        assertThrows(IllegalArgumentException.class, () -> new Layout.Run("00000000-0000-0000-0000-000000000000.sst", 0, 1, Map.of()));
+    }
+
+    @Test public void levelOneFilesMustNotOverlapEvenAtOneKey() {
+        var a = new Layout.Run("00000000-0000-0000-0000-000000000001.sst", 1, 1, Map.of("pk", new Layout.Bounds("01", "10")));
+        var b = new Layout.Run("00000000-0000-0000-0000-000000000002.sst", 1, 1, Map.of("pk", new Layout.Bounds("10", "20")));
+        var c = new Layout.Run("00000000-0000-0000-0000-000000000003.sst", 1, 1, Map.of("pk", new Layout.Bounds("11", "20")));
+        var metadata = new Layout.Run("00000000-0000-0000-0000-000000000004.sst", 1, 1, Map.of("", new Layout.Bounds("c1", "c2")));
+        var empty = Layout.empty();
+        assertThrows(IllegalArgumentException.class, () -> new Layout(1, 8, 0, "", 0, 0, 0, 0, List.of(a, b)));
+        var disjoint = new Layout(1, 8, 0, "", 0, 0, 0, 0, List.of(c, metadata, a));
+        assertEquals(3, disjoint.runs().size());
+        // Level-0 files may overlap anything.
+        new Layout(1, 8, 0, "", 0, 0, 0, 0, List.of(a, new Layout.Run(b.name(), 0, 1, b.indexes())));
+        assertEquals(0, empty.runs().size());
     }
 }

@@ -31,6 +31,9 @@ record Layout(long generation, long position, long revision, String head, long l
         runs = List.copyOf(runs);
         if (runs.stream().map(Run::name).distinct().count() != runs.size())
             throw new IllegalArgumentException("Invalid sorted file inventory");
+        var levelOne = runs.stream().filter(run -> run.level() == 1).sorted(Run::compareFirst).toList();
+        for (int i = 1; i < levelOne.size(); i++)
+            if (!levelOne.get(i - 1).before(levelOne.get(i))) throw new IllegalArgumentException("Overlapping level-1 files");
     }
     record Bounds(String lower, String upper) {
         Bounds {
@@ -43,9 +46,14 @@ record Layout(long generation, long position, long revision, String head, long l
             return (above > 0 || above == 0 && fromInclusive) && (below < 0 || below == 0 && toInclusive);
         }
     }
-    record Run(String name, Map<String, Bounds> indexes) {
+    /**
+     * A sorted file: level 0 files come from flushes and may overlap; level 1 files have disjoint
+     * (index, key) ranges. {@code bytes} is the file length, used by the compaction policy.
+     */
+    record Run(String name, int level, long bytes, Map<String, Bounds> indexes) {
         Run {
-            if (name == null || !name.matches("[0-9a-f-]{36}\\.sst") || indexes == null || indexes.isEmpty())
+            if (name == null || !name.matches("[0-9a-f-]{36}\\.sst") || indexes == null || indexes.isEmpty()
+                    || level < 0 || level > 1 || bytes < 1)
                 throw new IllegalArgumentException("Invalid file descriptor");
             for (var entry : indexes.entrySet()) {
                 var bounds = entry.getValue();
@@ -57,7 +65,7 @@ record Layout(long generation, long position, long revision, String head, long l
                     new Protocol.Mutation(entry.getKey(), bounds.upper(), "", false);
                 }
             }
-            indexes = Collections.unmodifiableMap(new TreeMap<>(indexes));
+            indexes = Collections.unmodifiableNavigableMap(new TreeMap<>(indexes));
         }
         boolean overlaps(String index, String lower, boolean lowerInclusive, String upper, boolean upperInclusive) {
             var bounds = indexes.get(index);
@@ -66,6 +74,20 @@ record Layout(long generation, long position, long revision, String head, long l
         boolean overlaps(Protocol.Scan scan) {
             return overlaps(scan.index(), scan.lower(), scan.lowerInclusive(), scan.upper(), scan.upperInclusive());
         }
+        private static int compare(String index, String key, String otherIndex, String otherKey) {
+            int c = index.compareTo(otherIndex);
+            return c != 0 ? c : key.compareTo(otherKey);
+        }
+        private java.util.Map.Entry<String, Bounds> first() { return ((java.util.NavigableMap<String, Bounds>) indexes).firstEntry(); }
+        private java.util.Map.Entry<String, Bounds> last() { return ((java.util.NavigableMap<String, Bounds>) indexes).lastEntry(); }
+        int compareFirst(Run other) {
+            return compare(first().getKey(), first().getValue().lower(), other.first().getKey(), other.first().getValue().lower());
+        }
+        /** Whether every entry of this file orders before every entry of {@code other}. */
+        boolean before(Run other) {
+            return compare(last().getKey(), last().getValue().upper(), other.first().getKey(), other.first().getValue().lower()) < 0;
+        }
+        boolean disjoint(Run other) { return before(other) || other.before(this); }
     }
     record Envelope(String body, String sha256) {}
     static Layout empty() { return new Layout(0, 8, 0, "", 0, 0, 0, 0, List.of()); }

@@ -2,6 +2,9 @@
 
 This is the implemented single-machine prototype. It is independent of the
 SIBench gRPC protocol and is not a complete lakehouse transaction coordinator.
+The serverless lifecycle requirements in the [design contract](index-service.md)
+describe the target; the JVM and local filesystem used here are its current test
+environment, not a certified serverless deployment.
 
 ## Source authority and requests
 
@@ -32,7 +35,7 @@ deployment interface in this prototype.
 | `POST /commit` | `parent`, `id`, `changes` | `{"id":"accepted-commit"}` |
 | `POST /read` | `at`, `scans` | `at` and one ordered result array per scan |
 | `POST /flush` | None | Storage statistics after flushing the Memtable |
-| `POST /compact` | None | Storage statistics after merging selected sorted files |
+| `POST /compact` | None | Storage statistics after merging all sorted files into level 1 |
 | `GET /stats` | None | Refreshed storage statistics |
 
 A mutation has `index`, `key`, `value`, `delete`, and optional `identity` (defaults to key). Index names and commit
@@ -107,30 +110,51 @@ Every server opens the same `publish.lock` and `journal` files. Any server can
 publish. An OS file lock serializes journal refresh and append across processes;
 a per-directory JVM lock also prevents closing another handle from releasing
 the process's POSIX locks during publication. Lock acquisition has a five-second
-budget. Store calls within one instance are synchronized.
+budget. Within one instance, commits, catch-up, staging, flush, and layout
+replacement hold that lock; reads usually do not (see below), so a long scan
+does not delay other requests.
 
 The journal begins with a file-type marker. Each frame contains a bounded
 payload length, the complete transaction JSON, a SHA-256 digest, and a completion
-marker. There is no supported legacy format or format revision field. Start new experiments
+marker. A layout frame instead carries the generation of a layout that was just
+replaced; it is appended after the new layout is durable and before replaced
+files are deleted. There is no supported legacy format or format revision field. Start new experiments
 with fresh state; retained states from earlier prototypes require their matching
 frozen binary, rather than an in-place upgrade.
 
-While holding the lock, a publisher refreshes prior complete frames, validates
-the parent, appends one complete frame, forces the journal to local storage,
-and installs its transaction into the local Memtable. Normal publication requires
-no batch timer, object upload, or compaction. When a complete transaction brings
-the Memtable charge to its limit, a synchronous flush provides backpressure
-before returning. This flush latency is part of the triggering request, not
-hidden behind an acknowledgment. Directory creation and initial file entries
-are also forced before the store becomes available.
+Commits are queued per instance and published in groups. One committer takes
+every queued commit, and while holding the lock refreshes prior complete frames
+and validates each commit in queue order: a parent may be the previous commit of
+the same group, which is not durable yet. A rejected commit is not written, so a
+later commit naming it as parent is rejected too; nothing is reparented or
+retried. The accepted frames are appended with one write and one fsync, then
+installed in the Memtable; only then do their acknowledgments complete. A
+resubmitted identical commit is acknowledged after its group is durable. Normal
+publication requires no batch timer, object upload, or compaction. A group
+holds at most 64 MiB of frames; a longer queue is published as several groups.
+When a group brings the Memtable charge to its limit, the Memtable is frozen and
+an empty one takes later commits. A background flusher writes the oldest frozen
+Memtable outside the lock, then reloads the layout under the lock and installs
+the file only if that Memtable is still the next checkpoint; otherwise another
+flush already covers those journal bytes and the file is deleted. While two
+frozen Memtables wait, new groups wait too (`writeStallMillis`). A failed flush
+poisons the instance. Explicit flush, and Memtable pressure while replaying the
+journal, flush synchronously under the lock. Directory creation and initial file entries are also forced before
+the store becomes available.
 
-A current-state read acquires the same lock, refreshes complete frames, and
-captures a read point and opens the selected immutable files before releasing
-the lock. It then merges their ordered records with the Memtable. Therefore,
-reads beginning after a successful acknowledgment cannot return
+Each published state is an immutable view: head, internal revision, layout,
+Memtable, and frozen Memtables. A read whose journal length does not exceed what
+this instance has written uses the current view without the lock (other
+publishers append only under the file lock, which this instance holds while its
+own frames are ahead of its view); otherwise, and for
+transaction-local reads, it takes the lock and refreshes first. A view's
+Memtable may already hold rows of a group being installed; their revisions are
+above the view's and are not returned. Files a scan may read are pinned until
+the read ends; a point scan does not pin files its Bloom filter excludes, and a lock-free read that finds a file already replaced retries under the
+lock. Therefore, reads beginning after a successful acknowledgment cannot return
 state preceding that commit, although reads may observe later commits. An
 already-started query can retain its captured state. Catch-up contributes to
-query latency; append, fsync, and publication contribute to commit latency.
+query latency; queueing, append, fsync, and publication contribute to commit latency.
 
 The internal history ordinal is private to the index and does not reinterpret
 source commit identifiers. All historical versions are retained. No full Trace
@@ -141,23 +165,34 @@ or source inventory is accepted by the service.
 Data records and commit-identity/digest records share the same ordered storage;
 commit identities no longer require an unbounded in-memory map. The reserved
 empty index namespace holds identity records and is unavailable to callers.
-Records are ordered by index, key, and internal revision. A file contains framed
-records, an on-disk offset directory, and a checked footer. Binary search reads
-the directory from disk; the full key directory is not loaded into memory.
-Each record checksum includes its ordinal, so an offset pointing at a different
-valid record is rejected. Versions and tombstones are preserved without GC.
+Records are ordered by index, key, and internal revision. A file contains
+blocks of about 16 KiB of framed records, a block directory, a Bloom filter, and
+a checked footer. Each block carries a CRC32C over its records and row offsets;
+the directory records every block's offset, length, record count, and first
+index/key, and the directory with the filter carries its own CRC32C. A block
+whose first record differs from its directory entry is rejected. The filter
+covers every index/key in the file, including tombstones and old versions, at
+16 bits per key with 11 probes, all within one 512-bit block so a check touches
+one cache line (about 0.25% false positives). Versions and tombstones are preserved without GC.
+
+A store keeps each file it has read open with its block directory and filter
+in memory until the file leaves the layout or the store closes. A lookup
+binary-searches the directory, reads one block, and binary-searches that
+block's offsets, decoding only the records it compares. This memory is not
+part of the Memtable charge; it grows with the number of blocks and distinct
+keys in the open files.
 
 Memtable charge is `256 + 2 * (index + key + identity + value + commit string lengths)` per
 stored record; replacement of the same transaction-local key updates the charge.
-The threshold is checked only after complete transactions, so the transient
-charge can exceed it by one bounded transaction. Request parsing, result buffers,
+The threshold is checked only after complete groups, so the active charge can
+exceed it by one group, and up to two frozen Memtables can be held in addition. Request parsing, result buffers,
 merge cursors, and the file inventory are additional memory. The limit is
 1 KiB..256 MiB, default 4 MiB. Smaller limits are useful for forced-spill tests.
 
 A flush forces a new sorted file and its directory entry, then atomically
 replaces and forces a checksummed `layout` containing the exact run inventory,
 covered journal byte position, head identity, and counters. Each file descriptor
-also carries its exact minimum and maximum key for every index present in that
+also carries its level, its length, and its exact minimum and maximum key for every index present in that
 file, including the reserved metadata index. Bounds are derived while writing
 all records, including tombstones and every retained version; they are published
 atomically with file membership. Invalid or missing descriptors are rejected.
@@ -170,32 +205,62 @@ under the publication lock. Grouped scans use the union of candidate files;
 all selected versions still go through ordinary merge/visibility checks. Bounds
 never represent only live or latest entries: dropping deleted or old keys from
 them would incorrectly prune historical reads. Irrelevant files are not audited
-by that query; checksums remain checked on the files/records actually read.
+by that query; checksums remain checked on the directories and blocks actually
+read. A point scan (equal inclusive bounds) also skips a selected file whose
+filter excludes its key, and commit-identity lookups skip files in the same way;
+false positives only cost a block read.
 
 After refresh, a read at the current head uses its already established internal
 revision directly. Historical identities still require a retained commit record;
 unknown identities fail. Metadata lookups may also exclude files by the reserved
 index's bounds. No arithmetic is applied to source commit identifiers.
 
-Selection still examines the complete descriptor inventory on each read and
-reloads the layout; it is not a separate metadata index or an inventory cache.
+Selection still examines the complete descriptor inventory on each read. A
+handle reloads the layout only when the journal has grown; because every flush
+and compaction appends a layout frame, an unchanged journal length means the
+cached layout is current. A handle steps over the layout frames it appends itself. Flush and compaction always reload it first. If a
+publisher stopped after saving a layout but before its frame, other handles keep
+reading the previous, still-present files until the next journal append; a
+memory-pressure flush that finds such a layout fails instead of overwriting it.
+Bloom filters prune point lookups only; range scans still read every file whose
+bounds overlap.
 Overlapping key ranges and full scans may still need every file. Descriptor
 bytes and parsing are additional memory/I/O costs; they do not change the
 Memtable charge limit. Use fresh state for this checkpoint layout; previous
 prototype states remain paired with their frozen binaries.
 
-Explicit compaction opens and pins its input file descriptors under the
-publication lock, merges outside that lock with one cursor per input, and
+Flushes write level-0 files, which may overlap. Level-1 files have disjoint
+(index, key) ranges, and every version of one key stays in one file; the layout
+rejects overlapping level-1 files. After each installed flush, if level 0 has at
+least 4 files holding a tenth of level 1's bytes, or 8 files, a background
+compactor merges level 0 with the level-1 files its range overlaps, writing new
+level-1 files of about 256 MiB that end at key boundaries. Hash-distributed keys
+make every level-1 file overlap, so each merge rewrites level 1; the trigger
+bounds that to roughly ten times the flushed bytes. `POST /compact` merges every
+file into level 1.
+
+Level-1 files live in the store's `level1/` subdirectory; the journal, `layout`,
+lock, staged transactions, binding, and level-0 files stay in the store
+directory. A file's location follows from its level in the layout. Compaction is
+the only rewrite of level 1, so `level1/` may be a mount or symbolic link to other
+storage that every publisher sees at the same path. Level-1 files are created
+once, written sequentially and forced, read by offset, and deleted; they are
+never renamed or appended. The tested storage is still a local filesystem;
+object storage is not implemented.
+
+A compaction selects its inputs under the publication lock, opens them and
+merges outside that lock with one cursor per input (an input already deleted
+means another compaction replaced it, and this one gives up), and
 rechecks input membership before publication. New files published meanwhile
 remain in the replacement layout. If another compactor already replaced an
 input, the unused output is discarded and its completed I/O is still counted.
-After the new layout is durable, obsolete inputs are unlinked. Existing readers
+After the new layout is durable and the lock is released, obsolete inputs are
+unlinked; a lock-free read that finds one already gone retries under the lock. Existing readers
 can finish through their open descriptors on the tested Linux filesystem.
 This behavior is not certification for EFS or other filesystems.
 
-Compaction currently merges all selected runs and never drops logical history.
-It is a simple write-amplification reference, not a range-aware or tiered policy.
-No automatic compaction scheduler, orphan-file collector, or log reclamation is
+Compaction never drops logical history. There is one compacted level, not a
+multi-level or tiered policy. No orphan-file collector or log reclamation is
 implemented. Stop services before manual diagnosis; never edit live files.
 
 ## Measurement boundaries
@@ -209,16 +274,20 @@ memory-pressure flush, just like other catch-up operations.
   every accepted operation including deletes, excluding commit envelope and
   identity metadata. Exact idempotent resubmissions do not add bytes.
 - `walBytes`: journal size excluding its file-type marker, including frame and
-  commit metadata. The journal is retained after flushing.
-- `flushBytes`: generated sorted-file lengths from completed flushes.
+  commit metadata and layout frames. The journal is retained after flushing.
+- `flushBytes`: generated sorted-file lengths from installed flushes; files
+  discarded because another flush covered the same bytes are not counted.
+- `memoryCharge` / `frozenMemtables`: charge of the active and frozen Memtables /
+  frozen Memtables waiting for the flusher.
+- `writeStallMillis`: time commit groups waited for the flusher in this instance.
 - `compactionReadBytes`: actual application file-read bytes in completed merges,
-  including offset-directory reads; not physical device I/O or cache misses.
+  including block-directory and filter reads; not physical device I/O or cache misses.
 - `compactionWriteBytes`: generated sorted-file lengths from completed merges,
   including outputs discarded after a publication conflict.
 
-Sorted-file write counters include file headers, record checksums, commit
-identity records, the offset directory, and footer. They exclude transaction staging, binding writes, the temporary
-offset spool, layout replacements, filesystem metadata, and failed incomplete
+Sorted-file write counters include file headers, block checksums and row offsets,
+commit identity records, the block directory, the Bloom filter, and footer. They
+exclude transaction staging, binding writes, layout replacements, filesystem metadata, and failed incomplete
 outputs; they must not be called total filesystem write amplification. Report
 WAL and sorted-file amplification separately, with initial loading separate from
 workload deltas. Include final flush/compaction and its elapsed time rather than
@@ -241,8 +310,8 @@ can confirm it after the store is healthy; do not invent a new identifier or
 parent as an automatic retry strategy.
 
 Reopening verifies the layout and replays complete journal frames after its
-covered position. Sorted record checksums are checked when records are read;
-covered journal bytes and every sorted record are not rescanned on each open.
+covered position. Sorted block checksums are checked when blocks are read;
+covered journal bytes and every sorted block are not rescanned on each open.
 A complete frame left
 by a process that exited before acknowledgment may become visible; readers force
 new complete frames before serving them. This is an unknown-outcome commit, not

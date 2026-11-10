@@ -7,10 +7,13 @@ protocol remains unchanged; this document does not establish wire compatibility.
 
 ## Responsibility and input boundary
 
-Relive serves index operations for a lakehouse through an online interface.
-Clients call the service; they do not coordinate other clients or act as servers.
-The service must work from requests and authoritative transaction information
-provided by the lakehouse integration, not from an offline workload inventory.
+Relive targets a serverless index for real-time lakehouses, serving point,
+range, and grouped lookups over concurrently maintained indexes. Application
+clients submit operations through an online interface; they do not coordinate
+other clients or manage index servers. The engine may execute within replaceable
+compute instances; a fixed HTTP service topology is not required by this contract.
+It must work from requests and authoritative transaction information provided by
+the lakehouse integration, not from an offline workload inventory.
 
 A SIBench Trace simulates those calls. Knowing a version identifier does not
 authorize reordering operations, inventing missing transaction boundaries, or
@@ -21,6 +24,29 @@ observed version as proof of complete input or snapshot coverage.
 The lakehouse integration must define the authority for transaction outcomes,
 the ordering constraints, and how complete delivery of a transaction's index
 changes is established. These interfaces have not been selected.
+
+## Compute lifecycle and durable state
+
+Acknowledged index state must survive loss of the compute instance that accepted
+it. Memory and instance-local temporary storage may cache or accelerate access,
+but cannot be the only authoritative copy of acknowledged state. A new instance
+must be able to reconstruct a valid read and publication state from shared
+durable information without recovering the previous instance's memory.
+
+Application clients, logical transactions, and compute instances have independent
+lifetimes. Operations on one transaction may reach different execution instances;
+the protocol must preserve transaction identity, progress, and outcome without
+requiring client affinity to a permanent process. Reusing a warm instance is an
+optimization, not a correctness prerequisite. Paused or replaced instances must
+not publish stale state after another instance has advanced it.
+
+Maintenance must have explicit execution and publication boundaries. It cannot
+depend on an invocation's background thread remaining alive after the invocation
+ends. Replacement or repeated execution must preserve authoritative state and
+active readers. Compute scheduling, recovery, and coordination mechanisms remain
+open choices; serverless does not mean the absence of coordination or persistent
+storage. Shared file storage and object storage are candidate resources, not
+interchangeable APIs or an already selected data placement.
 
 ## Multiple publishers
 
@@ -33,6 +59,8 @@ The scalable coordination mechanism has not been selected. Log partitioning,
 conditional updates, short critical sections, conflict validation, and publisher
 failure handling remain design questions. Multiple publishers alone do not imply
 lock-free execution or establish serializable transaction isolation.
+Evaluation must distinguish writers on disjoint partitions, writers on the same
+index, conflicting updates to the same key, and atomic multi-index transactions.
 
 ## Commit acknowledgment and visibility
 
@@ -62,6 +90,13 @@ caller. An asynchronous index update after lakehouse success is insufficient on
 its own. Coordinated acknowledgment or a correct query path over committed,
 not-yet-indexed changes is required; neither has been implemented or chosen.
 
+An index result must also have a defined relationship to the lakehouse snapshot
+used to fetch its data. Logical row identities, physical locations, deletion,
+file rewrite, and retained snapshots need an explicit resolution and protection
+contract. Correct index key/value results alone do not establish correct row
+retrieval after physical data movement. Lakehouse-specific integration and this
+resolution contract remain unimplemented.
+
 ## Real-time path and background maintenance
 
 The real-time read path must not require waiting for SST formation, compaction,
@@ -74,6 +109,11 @@ The protocol must specify log ordering, transaction completion, replay and
 duplicate handling, reader progress, and safe handoff to persisted index files.
 Log records must not be reclaimed before the replacement state and recovery
 requirements are satisfied. Cross-partition atomic visibility remains open.
+
+Log rotation, Memtable flush, and log reclamation are separate boundaries. A
+shared journal file, a sharded log, or a particular L0/L1 organization is not
+required by this contract. Maintenance backlog needs bounded resource behavior
+and explicit backpressure rather than unbounded deferred work.
 
 ## Index organization and metadata
 
@@ -116,3 +156,13 @@ Tests must supply requests incrementally rather than rely on complete Trace
 knowledge. Local tests cover a subset of these boundaries as described in the
 protocol and README. Full source replay, capacity, power-loss recovery, and
 performance acceptance have not been performed for Relive.
+
+Millisecond updates and lookups are evaluation targets, not current guarantees.
+Define the input scale, concurrency, result sizes, latency thresholds and
+percentiles, durability boundary, and cost budget before an acceptance run.
+Measure durable commit acknowledgment, source-commit-to-index availability, and
+lookup latency separately. Include catch-up, warm and cold cache conditions,
+fresh compute instances, and maintenance interference. Report throughput,
+backlog, resource peaks, and maintenance drain from the same run. A local or
+EC2-hosted experiment does not establish serverless lifecycle behavior, remote
+storage correctness, or production cost.

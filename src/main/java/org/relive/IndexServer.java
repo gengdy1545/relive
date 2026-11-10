@@ -19,7 +19,8 @@ import java.util.concurrent.TimeUnit;
 public final class IndexServer implements AutoCloseable {
     private final IndexStore store;
     private final HttpServer server;
-    private final ThreadPoolExecutor workers = new ThreadPoolExecutor(4, 4, 0, TimeUnit.SECONDS,
+    private static final int WORKERS = Integer.getInteger("relive.http.workers", 4);
+    private final ThreadPoolExecutor workers = new ThreadPoolExecutor(WORKERS, WORKERS, 0, TimeUnit.SECONDS,
             new ArrayBlockingQueue<>(64));
 
     public IndexServer(Path directory, int port) throws IOException {
